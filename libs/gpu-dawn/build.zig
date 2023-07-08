@@ -54,13 +54,13 @@ pub const Options = struct {
     separate_libs: bool = false,
 
     /// Whether or not to produce shared libraries instead of static ones
-    shared_libs: bool = false,
+    shared_libs: bool = true,
 
     /// Whether to build Dawn from source or not.
     from_source: bool = false,
 
     /// Produce static libraries at zig-out/lib
-    install_libs: bool = false,
+    install_libs: bool = true,
 
     /// The binary release version to use from https://github.com/hexops/mach-gpu-dawn/releases
     binary_version: []const u8 = "release-16f8a1d",
@@ -85,8 +85,8 @@ pub const Options = struct {
     }
 };
 
-pub fn link(b: *Build, step: *std.build.CompileStep, options: Options) !void {
-    const opt = options.detectDefaults(step.target_info.target);
+pub fn link(b: *Build, step: *std.build.CompileStep, opt: Options) !void {
+    const options = opt.detectDefaults(step.target_info.target);
 
     if (step.target_info.target.os.tag == .windows) @import("direct3d_headers").addLibraryPath(step);
     if (step.target_info.target.os.tag == .macos) {
@@ -102,9 +102,9 @@ pub fn link(b: *Build, step: *std.build.CompileStep, options: Options) !void {
     }
 
     try if (options.from_source)
-        linkFromSource(b, step, opt)
+        linkFromSource(b, step, options)
     else
-        linkFromBinary(b, step, opt);
+        linkFromBinary(b, step, options);
 }
 
 fn linkFromSource(b: *Build, step: *std.build.CompileStep, options: Options) !void {
@@ -160,6 +160,30 @@ fn linkFromSource(b: *Build, step: *std.build.CompileStep, options: Options) !vo
     _ = try buildLibSPIRVTools(b, lib_dawn, options);
     _ = try buildLibTint(b, lib_dawn, options);
     if (options.d3d12.?) _ = try buildLibDxcompiler(b, lib_dawn, options);
+
+    if (options.shared_libs) {
+        if (lib_dawn.target_info.target.os.tag == .windows) @import("direct3d_headers").addLibraryPath(lib_dawn);
+        if (lib_dawn.target_info.target.os.tag == .macos) {
+            // TODO(build-system): This cannot be imported with the Zig package manager
+            // error: TarUnsupportedFileType
+            //
+            // lib_dawn.linkLibrary(b.dependency("xcode_frameworks", .{
+            //     .target = lib_dawn.target,
+            //     .optimize = lib_dawn.optimize,
+            // }).artifact("xcode-frameworks"));
+            // @import("xcode_frameworks").addPaths(lib_dawn);
+            xcode_frameworks.addPaths(b, lib_dawn);
+        }
+
+        linkLibDawnCommonDependencies(b, lib_dawn, options);
+        linkLibDawnPlatformDependencies(b, lib_dawn, options);
+        linkLibDawnNativeDependencies(b, lib_dawn, options);
+        linkLibTintDependencies(b, lib_dawn, options);
+        linkLibSPIRVToolsDependencies(b, lib_dawn, options);
+        linkLibAbseilCppDependencies(b, lib_dawn, options);
+        linkLibDawnWireDependencies(b, lib_dawn, options);
+        linkLibDxcompilerDependencies(b, lib_dawn, options);
+    }
 }
 
 fn ensureGitRepoCloned(allocator: std.mem.Allocator, clone_url: []const u8, revision: []const u8, dir: []const u8) !void {
@@ -844,7 +868,6 @@ fn buildLibDawnNative(b: *Build, step: *std.build.CompileStep, options: Options)
             "mock",
             "SpirvValidation.cpp",
             "XlibXcbFunctions.cpp",
-            "dawn_proc.c",
         } else &.{
             "test",
             "benchmark",
@@ -1094,7 +1117,6 @@ fn buildLibTint(b: *Build, step: *std.build.CompileStep, options: Options) !*std
             "libs/dawn/src/tint/writer/syntax_tree",
             "libs/dawn/src/tint/ir",
             "libs/dawn/src/tint/ir/transform",
-            // "libs/dawn/src/tint/utils/io",
             "libs/dawn/src/tint/templates",
             "libs/dawn/src/tint/constant/",
             "libs/dawn/src/tint/diagnostic/",
@@ -1113,10 +1135,20 @@ fn buildLibTint(b: *Build, step: *std.build.CompileStep, options: Options) !*std
         .flags = flags.items,
         .excluding_contains = &.{ "test", "bench", "printer_windows", "printer_posix", "printer_other", "glsl.cc" },
     });
+    const tag = step.target_info.target.os.tag;
+    // only needed for dawn_proc
+    if (options.shared_libs and tag == .windows) {
+        try appendLangScannedSources(b, lib, .{
+            .rel_dirs = &.{
+                "libs/dawn/src/tint/utils/io",
+            },
+            .flags = flags.items,
+            .excluding_contains = &.{ "test", "bench", "posix", "other"},
+        });
+    }
 
     var cpp_sources = std.ArrayList([]const u8).init(b.allocator);
 
-    const tag = step.target_info.target.os.tag;
     if (tag == .windows) {
         try cpp_sources.append(sdkPath("/libs/dawn/src/tint/diagnostic/printer_windows.cc"));
     } else if (tag.isDarwin() or isLinuxDesktopLike(tag)) {
@@ -1368,6 +1400,19 @@ fn buildLibAbseilCpp(b: *Build, step: *std.build.CompileStep, options: Options) 
         .flags = flags.items,
         .excluding_contains = &.{ "_test", "_testing", "benchmark", "print_hash_of.cc", "gaussian_distribution_gentables.cc" },
     });
+
+    if (options.shared_libs) {
+        // only needed for dawn_proc
+        try appendLangScannedSources(b, lib, .{
+            .rel_dirs = &.{
+                "libs/dawn/third_party/abseil-cpp/absl/profiling/internal",
+            },
+            .flags = flags.items,
+            .excluding_contains = &.{ "_test", "_testing", "benchmark", "print_hash_of.cc", "gaussian_distribution_gentables.cc" },
+        });
+        lib.addCSourceFile("libs/dawn/third_party/abseil-cpp/absl/random/internal/distribution_test_util.cc", flags.items);
+    }
+
     return lib;
 }
 
@@ -1446,12 +1491,14 @@ fn buildLibDxcompiler(b: *Build, step: *std.build.CompileStep, options: Options)
     var flags = std.ArrayList([]const u8).init(b.allocator);
     try flags.appendSlice(&.{
         include("libs/"),
-        include("libs/DirectXShaderCompiler/include/llvm/llvm_assert"),
-        include("libs/DirectXShaderCompiler/include"),
-        include("libs/DirectXShaderCompiler/build/include"),
-        include("libs/DirectXShaderCompiler/build/lib/HLSL"),
-        include("libs/DirectXShaderCompiler/build/lib/DxilPIXPasses"),
-        include("libs/DirectXShaderCompiler/build/include"),
+        include("libs/dawn/third_party/swiftshader/third_party/llvm-10.0/configs/windows/include/"),
+        include("libs/dawn/third_party/swiftshader/third_party/llvm-16.0/llvm/include"),
+        include("libs/dawn/third_party/dxc/include/llvm"),
+        include("libs/dawn/third_party/dxc/include/llvm/llvm_assert"),
+        include("libs/dawn/third_party/dxc/include"),
+        include("libs/dawn/third_party/dxc/build/include"),
+        include("libs/dawn/third_party/dxc/build/lib/HLSL"),
+        include("libs/dawn/third_party/dxc/build/lib/DxilPIXPasses"),
         "-DUNREFERENCED_PARAMETER(x)=",
         "-Wno-inconsistent-missing-override",
         "-Wno-missing-exception-spec",
@@ -1464,35 +1511,43 @@ fn buildLibDxcompiler(b: *Build, step: *std.build.CompileStep, options: Options)
         "-DLLVM_ON_WIN32=1",
     });
 
+    lib.defineCMacro("__inexpressible_readableTo(size)", "");
+    lib.defineCMacro("_Out_writes_all_(s)", "");
+    lib.defineCMacro("_Out_writes_z_(s)", "");
+    lib.defineCMacro("_Use_decl_annotations_", "");
+    lib.defineCMacro("_Analysis_assume_nullterminated_(expr)", "");
+    lib.defineCMacro("_Analysis_assume_(expr)", "");
+    lib.defineCMacro("_In_z_", "");
+
     try appendLangScannedSources(b, lib, .{
         .debug_symbols = false,
         .rel_dirs = &.{
-            "libs/DirectXShaderCompiler/lib/Analysis/IPA",
-            "libs/DirectXShaderCompiler/lib/Analysis",
-            "libs/DirectXShaderCompiler/lib/AsmParser",
-            "libs/DirectXShaderCompiler/lib/Bitcode/Writer",
-            "libs/DirectXShaderCompiler/lib/DxcBindingTable",
-            "libs/DirectXShaderCompiler/lib/DxcSupport",
-            "libs/DirectXShaderCompiler/lib/DxilContainer",
-            "libs/DirectXShaderCompiler/lib/DxilPIXPasses",
-            "libs/DirectXShaderCompiler/lib/DxilRootSignature",
-            "libs/DirectXShaderCompiler/lib/DXIL",
-            "libs/DirectXShaderCompiler/lib/DxrFallback",
-            "libs/DirectXShaderCompiler/lib/HLSL",
-            "libs/DirectXShaderCompiler/lib/IRReader",
-            "libs/DirectXShaderCompiler/lib/IR",
-            "libs/DirectXShaderCompiler/lib/Linker",
-            "libs/DirectXShaderCompiler/lib/Miniz",
-            "libs/DirectXShaderCompiler/lib/Option",
-            "libs/DirectXShaderCompiler/lib/PassPrinters",
-            "libs/DirectXShaderCompiler/lib/Passes",
-            "libs/DirectXShaderCompiler/lib/ProfileData",
-            "libs/DirectXShaderCompiler/lib/Target",
-            "libs/DirectXShaderCompiler/lib/Transforms/InstCombine",
-            "libs/DirectXShaderCompiler/lib/Transforms/IPO",
-            "libs/DirectXShaderCompiler/lib/Transforms/Scalar",
-            "libs/DirectXShaderCompiler/lib/Transforms/Utils",
-            "libs/DirectXShaderCompiler/lib/Transforms/Vectorize",
+            "libs/dawn/third_party/dxc/lib/Analysis/IPA",
+            "libs/dawn/third_party/dxc/lib/Analysis",
+            "libs/dawn/third_party/dxc/lib/AsmParser",
+            "libs/dawn/third_party/dxc/lib/Bitcode/Writer",
+            "libs/dawn/third_party/dxc/lib/DxcBindingTable",
+            "libs/dawn/third_party/dxc/lib/DxcSupport",
+            "libs/dawn/third_party/dxc/lib/DxilContainer",
+            "libs/dawn/third_party/dxc/lib/DxilPIXPasses",
+            "libs/dawn/third_party/dxc/lib/DxilRootSignature",
+            "libs/dawn/third_party/dxc/lib/DXIL",
+            "libs/dawn/third_party/dxc/lib/DxrFallback",
+            "libs/dawn/third_party/dxc/lib/HLSL",
+            "libs/dawn/third_party/dxc/lib/IRReader",
+            "libs/dawn/third_party/dxc/lib/IR",
+            "libs/dawn/third_party/dxc/lib/Linker",
+            // "libs/dawn/third_party/dxc/lib/Miniz",
+            "libs/dawn/third_party/dxc/lib/Option",
+            "libs/dawn/third_party/dxc/lib/PassPrinters",
+            "libs/dawn/third_party/dxc/lib/Passes",
+            "libs/dawn/third_party/dxc/lib/ProfileData",
+            "libs/dawn/third_party/dxc/lib/Target",
+            "libs/dawn/third_party/dxc/lib/Transforms/InstCombine",
+            "libs/dawn/third_party/dxc/lib/Transforms/IPO",
+            "libs/dawn/third_party/dxc/lib/Transforms/Scalar",
+            "libs/dawn/third_party/dxc/lib/Transforms/Utils",
+            "libs/dawn/third_party/dxc/lib/Transforms/Vectorize",
         },
         .flags = flags.items,
     });
@@ -1500,13 +1555,15 @@ fn buildLibDxcompiler(b: *Build, step: *std.build.CompileStep, options: Options)
     try appendLangScannedSources(b, lib, .{
         .debug_symbols = false,
         .rel_dirs = &.{
-            "libs/DirectXShaderCompiler/lib/Support",
+            // "libs/dawn/third_party/dxc/lib/Support",
+            "libs/dawn/third_party/dxc/lib/Support/",
+            "libs/dawn/third_party/dxc/lib/Support/Windows/",
         },
         .flags = flags.items,
         .excluding_contains = &.{
             "DynamicLibrary.cpp", // ignore, HLSL_IGNORE_SOURCES
             "PluginLoader.cpp", // ignore, HLSL_IGNORE_SOURCES
-            "Path.cpp", // ignore, LLVM_INCLUDE_TESTS
+            // "Path.cpp", // ignore, LLVM_INCLUDE_TESTS
             "DynamicLibrary.cpp", // ignore
         },
     });
@@ -1514,7 +1571,7 @@ fn buildLibDxcompiler(b: *Build, step: *std.build.CompileStep, options: Options)
     try appendLangScannedSources(b, lib, .{
         .debug_symbols = false,
         .rel_dirs = &.{
-            "libs/DirectXShaderCompiler/lib/Bitcode/Reader",
+            "libs/dawn/third_party/dxc/lib/Bitcode/Reader",
         },
         .flags = flags.items,
         .excluding_contains = &.{
